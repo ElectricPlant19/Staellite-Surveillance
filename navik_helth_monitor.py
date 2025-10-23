@@ -2,17 +2,12 @@ import requests
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import date, timedelta
+from datetime import date
 import numpy as np
 import plotly.graph_objects as go
-import statistics
-from skyfield.api import load, wgs84, EarthSatellite
 
 MU = 398600.4418  # km^3/s^2
 R_EARTH = 6371.0  # km
-
-# Initialize Skyfield timescale
-ts = load.timescale()
 
 st.title("NavIK (IRNSS/NVS) - Health Analysis")
 
@@ -85,14 +80,6 @@ with st.expander("Health Tolerance Settings (click to expand)", expanded=False):
             step=0.1,
             help="Acceptable deviation from target inclination"
         )
-        longitude_tolerance = st.number_input(
-            "Longitude Tolerance (degrees)",
-            min_value=0.1,
-            max_value=5.0,
-            value=1.0,
-            step=0.1,
-            help="Acceptable deviation from target longitude"
-        )
         min_maneuvers_per_month = st.number_input(
             "Min Maneuvers/Month (for active maintenance)",
             min_value=0,
@@ -119,34 +106,6 @@ with st.expander("Health Tolerance Settings (click to expand)", expanded=False):
             step=0.1,
             help="Coefficient of Variation threshold for uniform maneuver spacing"
         )
-        enable_geo_analysis = st.checkbox(
-            "Enable Geographical Position Analysis",
-            value=True,
-            help="Calculate latitude/longitude variations (may be slower)"
-        )
-
-# Geo-box propagation parameters
-if enable_geo_analysis:
-    with st.expander("Geographical Analysis Settings", expanded=False):
-        col_geo1, col_geo2 = st.columns(2)
-        with col_geo1:
-            geo_timestep_minutes = st.number_input(
-                "Timestep (minutes)",
-                min_value=5,
-                max_value=60,
-                value=15,
-                step=5,
-                help="Time interval for position sampling"
-            )
-        with col_geo2:
-            geo_prop_duration_days = st.number_input(
-                "Propagation Duration (days)",
-                min_value=0.5,
-                max_value=5.0,
-                value=1.5,
-                step=0.5,
-                help="Duration to propagate orbit for position analysis"
-            )
 
 # Service requirements for NavIC satellites
 NAVIK_SERVICE_REQUIREMENTS = {
@@ -158,73 +117,6 @@ NAVIK_SERVICE_REQUIREMENTS = {
     "IRNSS-1I": {"longitude": 55.0, "inclination": 29.0},  # Assuming similar to 1B (replacement)
     "NVS-01": {"longitude": 129.5, "inclination": 5.0}
 }
-
-
-# GEOGRAPHICAL POSITION FUNCTIONS
-def calc_lat(row): 
-    """Calculate latitude for a single row."""
-    satellite = EarthSatellite(row['TLE_LINE1'], row['TLE_LINE2'], row['OBJECT_NAME'], ts)
-    t = row['EPOCH']
-    geocentric = satellite.at(ts.from_datetime(t))
-    lat, lon = wgs84.latlon_of(geocentric)
-    return lat.degrees
-
-def calc_lon(row): 
-    """Calculate longitude for a single row."""
-    satellite = EarthSatellite(row['TLE_LINE1'], row['TLE_LINE2'], row['OBJECT_NAME'], ts)
-    t = row['EPOCH']
-    geocentric = satellite.at(ts.from_datetime(t))
-    lat, lon = wgs84.latlon_of(geocentric)
-    return lon.degrees
-
-def get_geo_box_vectorized(satellite, epoch, timestep_minutes, prop_duration_days):
-    """
-    Calculate min, max, and mean latitude/longitude over a propagation period.
-    Returns: (min_lon, max_lon, mean_lon, min_lat, max_lat, mean_lat)
-    """
-    t1 = epoch
-    t2 = t1 + timedelta(days=prop_duration_days)
-    delta_t = (t2 - t1).seconds + 24*3600*(t2 - t1).days
-    n_steps = int(delta_t / (timestep_minutes * 60)) + 1
-    
-    # Create time array vectorized
-    time_offsets = np.arange(1, n_steps-1) * (60 * timestep_minutes)
-    time_offsets = time_offsets.tolist()
-    epochs = [t1 + timedelta(seconds=t) for t in time_offsets]
-    
-    # Convert epochs to Skyfield time objects
-    ts_times = [ts.from_datetime(t) for t in epochs]
-    
-    # Get positions
-    positions = [satellite.at(t) for t in ts_times]
-    
-    # Get lat/lon
-    lat_lon = [wgs84.latlon_of(pos) for pos in positions]
-    latitudes = [ll[0].degrees for ll in lat_lon]
-    longitudes = [ll[1].degrees for ll in lat_lon]
-    
-    return (min(longitudes), max(longitudes), statistics.mean(longitudes),
-            min(latitudes), max(latitudes), statistics.mean(latitudes))
-
-@st.cache_data(ttl=3600)
-def get_box_cols_optimized(df, timestep_minutes=15, prop_duration_days=1.5):
-    """
-    Optimized calculation of geographical position variations for entire dataframe.
-    Returns: (min_lons, max_lons, mean_lons, min_lats, max_lats, mean_lats)
-    """
-    def process_row(row):
-        satellite = EarthSatellite(row['TLE_LINE1'], row['TLE_LINE2'], 
-                                 row['OBJECT_NAME'], ts)
-        return get_geo_box_vectorized(satellite, row['EPOCH'], 
-                                    timestep_minutes, prop_duration_days)
-    
-    # Use apply to process each row
-    results = df.apply(process_row, axis=1)
-    
-    # Convert results to separate arrays
-    min_lons, max_lons, mean_lons, min_lats, max_lats, mean_lats = zip(*results)
-    
-    return min_lons, max_lons, mean_lons, min_lats, max_lats, mean_lats
 
 
 # MANEUVER DETECTION FUNCTIONS
@@ -345,15 +237,13 @@ def calculate_maneuver_uniformity(maneuver_dates):
     return np.std(intervals) / np.mean(intervals)
 
 def assess_satellite_health(sat_name, sat_df, maneuver_events,
-                           inc_tolerance, lon_tolerance, min_man_per_month, 
-                           max_man_per_month, uniformity_threshold,
-                           geo_data=None):
+                           inc_tolerance, min_man_per_month, 
+                           max_man_per_month, uniformity_threshold):
     """Comprehensive health assessment for a satellite."""
     
     # Get service requirements
     requirements = NAVIK_SERVICE_REQUIREMENTS.get(sat_name, {})
     target_inclination = requirements.get("inclination", None)
-    target_longitude = requirements.get("longitude", None)
     
     # Calculate metrics
     mean_inclination = sat_df['INCLINATION'].mean()
@@ -372,17 +262,6 @@ def assess_satellite_health(sat_name, sat_df, maneuver_events,
     else:
         inc_score = None
         inc_deviation = None
-    
-    # Longitude deviation score (if geo data available)
-    lon_score = None
-    lon_deviation = None
-    if geo_data is not None and target_longitude is not None:
-        mean_longitude = geo_data['mean_longitude']
-        lon_deviation = abs(mean_longitude - target_longitude)
-        # Handle wraparound (e.g., 359° vs 1°)
-        if lon_deviation > 180:
-            lon_deviation = 360 - lon_deviation
-        lon_score = max(0, 100 - (lon_deviation / lon_tolerance) * 100)
     
     # Maintenance activity score (0-100)
     if maneuvers_per_month < min_man_per_month:
@@ -408,15 +287,9 @@ def assess_satellite_health(sat_name, sat_df, maneuver_events,
         uniformity_cov = None
     
     # Overall health score (weighted average)
-    if lon_score is not None and inc_score is not None:
-        # All parameters available
-        overall_score = (inc_score * 0.35 + lon_score * 0.25 + 
-                        maintenance_score * 0.25 + uniformity_score * 0.15)
-    elif inc_score is not None:
-        # Only inclination available
+    if inc_score is not None:
         overall_score = (inc_score * 0.5 + maintenance_score * 0.3 + uniformity_score * 0.2)
     else:
-        # No target data
         overall_score = (maintenance_score * 0.6 + uniformity_score * 0.4)
     
     # Health status determination
@@ -444,14 +317,6 @@ def assess_satellite_health(sat_name, sat_df, maneuver_events,
         else:
             remarks.append(f"⚠️ Inclination deviation exceeds tolerance ({inc_deviation:.2f}°)")
     
-    if lon_score is not None and lon_deviation is not None:
-        if lon_deviation <= lon_tolerance * 0.3:
-            remarks.append(f"Excellent longitude control (±{lon_deviation:.2f}°)")
-        elif lon_deviation <= lon_tolerance:
-            remarks.append(f"Longitude within tolerance (±{lon_deviation:.2f}°)")
-        else:
-            remarks.append(f"⚠️ Longitude deviation exceeds tolerance ({lon_deviation:.2f}°)")
-    
     if maneuvers_per_month < min_man_per_month:
         remarks.append(f"⚠️ Low maintenance activity ({maneuvers_per_month:.1f}/month)")
     elif maneuvers_per_month > max_man_per_month:
@@ -468,13 +333,7 @@ def assess_satellite_health(sat_name, sat_df, maneuver_events,
     if std_inclination < 0.1:
         remarks.append("Stable orbital parameters")
     
-    # Add geographical variation remarks if available
-    if geo_data is not None:
-        lat_range = geo_data['max_latitude'] - geo_data['min_latitude']
-        lon_range = geo_data['max_longitude'] - geo_data['min_longitude']
-        remarks.append(f"Lat range: {lat_range:.2f}°, Lon range: {lon_range:.2f}°")
-    
-    result = {
+    return {
         'Satellite': sat_name,
         'Health Status': f"{status_color} {health_status}",
         'Overall Score': round(overall_score, 1),
@@ -485,14 +344,6 @@ def assess_satellite_health(sat_name, sat_df, maneuver_events,
         'Uniformity (CoV)': round(uniformity_cov, 3) if uniformity_cov else "N/A",
         'Remarks': " | ".join(remarks)
     }
-    
-    # Add longitude data if available
-    if lon_score is not None:
-        result['Target Lon. (°)'] = target_longitude
-        result['Mean Lon. (°)'] = round(geo_data['mean_longitude'], 3)
-        result['Lon. Dev. (°)'] = round(lon_deviation, 3)
-    
-    return result
 
 
 # CACHING HELPERS
@@ -509,7 +360,7 @@ def get_spacetrack_session(username: str, password: str):
 
 @st.cache_data(ttl=3600)
 def fetch_tle_json_cached(norad_id: int, start_date: str, end_date: str, username: str, password: str):
-    """Cached fetch of the GP history JSON with TLE lines."""
+    """Cached fetch of the GP history JSON."""
     session = get_spacetrack_session(username, password)
 
     gp_url = (
@@ -524,7 +375,7 @@ def fetch_tle_json_cached(norad_id: int, start_date: str, end_date: str, usernam
 def fetch_and_classify_satellite(norad_id: int, start_date: str, end_date: str,
                                  username: str, password: str,
                                  gso_center=5.0, gso_tol=1, igso_min=10, deviation_tol=0.3):
-    """Fetches and classifies satellite data with TLE lines for geo analysis."""
+    """Fetches and classifies satellite data."""
     data = fetch_tle_json_cached(int(norad_id), start_date, end_date, username, password)
 
     if not data:
@@ -532,19 +383,12 @@ def fetch_and_classify_satellite(norad_id: int, start_date: str, end_date: str,
 
     df = pd.DataFrame(data)
 
-    # Normalize column names
     if 'EPOCH' not in df.columns and 'epoch' in df.columns:
         df.rename(columns={'epoch': 'EPOCH'}, inplace=True)
     if 'INCLINATION' not in df.columns and 'inclination' in df.columns:
         df.rename(columns={'inclination': 'INCLINATION'}, inplace=True)
     if 'SEMIMAJOR_AXIS' not in df.columns and 'semimajor_axis' in df.columns:
         df.rename(columns={'semimajor_axis': 'SEMIMAJOR_AXIS'}, inplace=True)
-    if 'TLE_LINE1' not in df.columns and 'tle_line1' in df.columns:
-        df.rename(columns={'tle_line1': 'TLE_LINE1'}, inplace=True)
-    if 'TLE_LINE2' not in df.columns and 'tle_line2' in df.columns:
-        df.rename(columns={'tle_line2': 'TLE_LINE2'}, inplace=True)
-    if 'OBJECT_NAME' not in df.columns and 'object_name' in df.columns:
-        df.rename(columns={'object_name': 'OBJECT_NAME'}, inplace=True)
 
     if 'EPOCH' not in df.columns or 'INCLINATION' not in df.columns:
         raise ValueError("GP JSON missing required fields 'EPOCH' or 'INCLINATION'")
@@ -552,17 +396,6 @@ def fetch_and_classify_satellite(norad_id: int, start_date: str, end_date: str,
     required_cols = ['EPOCH', 'INCLINATION']
     if 'SEMIMAJOR_AXIS' in df.columns:
         required_cols.append('SEMIMAJOR_AXIS')
-    
-    # Keep TLE lines for geographical analysis
-    if 'TLE_LINE1' in df.columns:
-        required_cols.append('TLE_LINE1')
-    if 'TLE_LINE2' in df.columns:
-        required_cols.append('TLE_LINE2')
-    if 'OBJECT_NAME' in df.columns:
-        required_cols.append('OBJECT_NAME')
-    elif 'NORAD_CAT_ID' in df.columns:
-        df['OBJECT_NAME'] = df['NORAD_CAT_ID'].astype(str)
-        required_cols.append('OBJECT_NAME')
     
     df = df[required_cols].copy()
     df['EPOCH'] = pd.to_datetime(df['EPOCH'])
@@ -575,18 +408,6 @@ def fetch_and_classify_satellite(norad_id: int, start_date: str, end_date: str,
     mean_incl = df['INCLINATION'].mean()
     df['mean_inclination'] = mean_incl
     df['maintained'] = df['INCLINATION'].apply(lambda x: abs(x - mean_incl) <= deviation_tol)
-
-    df = df.sort_values('EPOCH').reset_index(drop=True) <= deviation_tol
-
-    df = df.sort_values('EPOCH').reset_index(drop=True)
-
-    if 'SEMIMAJOR_AXIS' in df.columns:
-        df['SEMIMAJOR_AXIS'] = df['SEMIMAJOR_AXIS'].astype(float)
-        df['altitude_km'] = df['SEMIMAJOR_AXIS'] - R_EARTH
-    else:
-        df['SEMIMAJOR_AXIS'] = np.nan
-        df['altitude_km'] = np.nan
-
 
     df = df.sort_values('EPOCH').reset_index(drop=True)
 
@@ -658,44 +479,6 @@ if st.button("Fetch NavIK & Analyze Health"):
         else:
             df_all = pd.concat(all_dfs, ignore_index=True, sort=False)
 
-            # GEOGRAPHICAL POSITION ANALYSIS (if enabled)
-            geo_analysis_results = {}
-            if enable_geo_analysis:
-                st.markdown("### Geographical Position Analysis")
-                with st.spinner("Calculating latitude/longitude variations..."):
-                    for sat_name in sorted(df_all['satellite'].unique()):
-                        sat_df = df_all[df_all['satellite'] == sat_name].copy()
-                        
-                        # Check if TLE data is available
-                        if 'TLE_LINE1' in sat_df.columns and 'TLE_LINE2' in sat_df.columns:
-                            try:
-                                # Sample subset for geo analysis (to avoid excessive computation)
-                                sample_size = min(10, len(sat_df))
-                                sat_sample = sat_df.sample(n=sample_size, random_state=42).copy()
-                                
-                                min_lons, max_lons, mean_lons, min_lats, max_lats, mean_lats = get_box_cols_optimized(
-                                    sat_sample,
-                                    timestep_minutes=int(geo_timestep_minutes),
-                                    prop_duration_days=geo_prop_duration_days
-                                )
-                                
-                                geo_analysis_results[sat_name] = {
-                                    'min_longitude': np.mean(min_lons),
-                                    'max_longitude': np.mean(max_lons),
-                                    'mean_longitude': np.mean(mean_lons),
-                                    'min_latitude': np.mean(min_lats),
-                                    'max_latitude': np.mean(max_lats),
-                                    'mean_latitude': np.mean(mean_lats)
-                                }
-                                
-                            except Exception as e:
-                                st.warning(f"Geo analysis failed for {sat_name}: {str(e)}")
-                        else:
-                            st.info(f"TLE data not available for {sat_name} - skipping geo analysis")
-                
-                if geo_analysis_results:
-                    st.success(f"Geo analysis completed for {len(geo_analysis_results)} satellites")
-            
             # MANEUVER DETECTION
             st.markdown("### Maneuver Detection Analysis")
             
@@ -731,13 +514,10 @@ if st.button("Fetch NavIK & Analyze Health"):
                 })
                 
                 # HEALTH ASSESSMENT
-                geo_data = geo_analysis_results.get(sat_name, None) if enable_geo_analysis else None
                 health_data = assess_satellite_health(
                     sat_name, sat_df, maneuver_events,
-                    inclination_tolerance, longitude_tolerance,
-                    min_maneuvers_per_month, max_maneuvers_per_month, 
-                    maneuver_uniformity_threshold,
-                    geo_data=geo_data
+                    inclination_tolerance, min_maneuvers_per_month,
+                    max_maneuvers_per_month, maneuver_uniformity_threshold
                 )
                 health_assessments.append(health_data)
             
@@ -765,27 +545,13 @@ if st.button("Fetch NavIK & Analyze Health"):
             st.markdown("### 🏥 Satellite Health Assessment")
             health_df = pd.DataFrame(health_assessments)
             
-            # Determine which columns to display based on available data
-            base_cols = [
-                'Satellite', 'Health Status', 'Overall Score', 
-                'Target Incl. (°)', 'Mean Incl. (°)', 'Incl. Dev. (°)',
-                'Maneuvers/Month', 'Uniformity (CoV)'
-            ]
-            
-            # Add longitude columns if geo analysis was performed
-            if enable_geo_analysis and 'Target Lon. (°)' in health_df.columns:
-                display_cols = [
-                    'Satellite', 'Health Status', 'Overall Score',
-                    'Target Incl. (°)', 'Mean Incl. (°)', 'Incl. Dev. (°)',
-                    'Target Lon. (°)', 'Mean Lon. (°)', 'Lon. Dev. (°)',
-                    'Maneuvers/Month', 'Uniformity (CoV)'
-                ]
-            else:
-                display_cols = base_cols
-            
             # Display health summary
             st.dataframe(
-                health_df[display_cols],
+                health_df[[
+                    'Satellite', 'Health Status', 'Overall Score', 
+                    'Target Incl. (°)', 'Mean Incl. (°)', 'Incl. Dev. (°)',
+                    'Maneuvers/Month', 'Uniformity (CoV)'
+                ]],
                 hide_index=True,
                 use_container_width=True
             )
